@@ -1,0 +1,228 @@
+CREATE OR REPLACE PROCEDURE detect_outliers_pyod(
+    input_table_name VARCHAR,
+    group_columns ARRAY,
+    target_column VARCHAR,
+    contamination_rate FLOAT, -- Expected proportion of outliers in the data (e.g., 0.01 for 1%)
+    output_table_name VARCHAR
+)
+RETURNS VARCHAR
+LANGUAGE PYTHON
+RUNTIME_VERSION = '3.12'
+PACKAGES = ('snowflake-snowpark-python', 'pandas', 'pyod', 'scikit-learn')
+HANDLER = 'run_outlier_detection'
+AS
+$$
+import pandas as pd
+from snowflake.snowpark.session import Session
+from snowflake.snowpark.types import StructType, StructField, StringType, IntegerType, FloatType
+from pyod.models.iforest import IForest # Using Isolation Forest from PyOD
+
+def run_outlier_detection(session: Session, input_table_name: str, group_columns: list, target_column: str, contamination_rate: float, output_table_name: str):
+    # Read data from the input table
+    snowpark_df = session.table(input_table_name)
+    
+    # Select only the necessary columns for processing
+    all_cols = group_columns + [target_column]
+    df_pd = snowpark_df.select(all_cols).to_pandas()
+
+    if df_pd.empty:
+        return f"Input table {input_table_name} is empty. No outliers detected."
+
+    # Prepare an empty list to store results
+    all_results = []
+
+    # Iterate through groups
+    for name, group in df_pd.groupby(group_columns):
+        if group.shape[0] == 0:
+            continue
+            
+        # Extract the target column values for the current group
+        # Reshape for PyOD which expects a 2D array (n_samples, n_features)
+        X = group[[target_column]].values 
+        
+        # Handle cases where the group might be too small for IForest
+        # IForest requires at least 2 samples to fit, and contamination_rate should be <= (n_samples - 1) / n_samples
+        if X.shape[0] < 2 :
+            # If only one sample, it can't be an outlier relative to itself
+            # Or if contamination_rate is too high, set to 0 (no outlier)
+            group['outlier'] = 0 
+            all_results.append(group)
+            continue
+            
+        # Adjust contamination for very small groups if needed (PyOD can sometimes fail with exact 1.0)
+        # Or ensure contamination_rate is valid for the group size
+        current_contamination = min(contamination_rate, (X.shape[0] - 1) / X.shape[0] if X.shape[0] > 1 else 0)
+        if current_contamination == 0 and contamination_rate > 0:
+             # If contamination becomes 0 due to group size, and user asked for more,
+             # it implies no outliers can be found with IForest, or this small group won't yield true outliers
+             group['outlier'] = 0
+             all_results.append(group)
+             continue
+
+
+        # Initialize and fit the Isolation Forest model
+        # max_samples='auto' handles small datasets, but a min limit can still exist for certain models.
+        # random_state for reproducibility
+        try:
+            clf = IForest(contamination=current_contamination, random_state=42, n_estimators=100)
+            clf.fit(X)
+            
+            # Predict outlier labels (0 for inlier, 1 for outlier)
+            group['outlier'] = clf.predict(X)
+            all_results.append(group)
+        except Exception as e:
+            # Log error and treat as no outliers for problematic groups
+            session.sql(f"INSERT INTO MY_LOGS (MESSAGE) VALUES ('Error processing group {name}: {e}')").collect()
+            group['outlier'] = 0
+            all_results.append(group)
+            
+    if not all_results:
+        return f"No results to write. All groups were empty or problematic."
+
+    # Combine all group results
+    final_results_df = pd.concat(all_results, ignore_index=True)
+
+    # Define schema for the output table
+    output_schema = StructType([
+        StructField(col.upper(), StringType(), True) for col in group_columns
+    ] + [
+        StructField(target_column.upper(), FloatType(), True),
+        StructField('OUTLIER', IntegerType(), True)
+    ])
+
+    # Convert pandas DataFrame to Snowpark DataFrame and save to output table
+    # Ensure column names match the desired output schema case
+    final_results_df.columns = [col.upper() for col in final_results_df.columns]
+    
+    # Create the output table
+    session.create_dataframe(final_results_df, schema=output_schema).write.mode('overwrite').save_as_table(output_table_name)
+    
+    return f"Outlier detection complete. Results written to {output_table_name}"
+
+$$;
+
+
+
+CALL detect_outliers_pyod(
+    input_table_name => 'YOUR_TABLE',
+    group_columns => ARRAY_CONSTRUCT('ATTR1', 'ATTR2', 'ATTR3'),
+    target_column => 'TGT',
+    contamination_rate => 0.25, -- Adjust this value based on your domain knowledge
+    output_table_name => 'YOUR_TABLE_OUTLIERS_PYOD'
+);
+
+
+select *
+from YOUR_TABLE_OUTLIERS_PYOD
+;
+
+
+CREATE OR REPLACE TABLE YOUR_LARGER_TABLE AS
+SELECT attr1, attr2, attr3, tgt FROM VALUES
+    -- Original Data
+    ('abc', 'foo', 'bar', 1),
+    ('abc', 'foo', 'bar', 2),
+    ('abc', 'foo', 'bar', 1),
+    ('abc', 'foo', 'bar', 10), -- Outlier in 'abc' group
+    ('def', 'foo', 'bar', 10),
+    ('def', 'foo', 'bar', 10),
+    ('def', 'foo', 'bar', 11),
+    ('def', 'foo', 'bar', 100), -- Outlier in 'def' group
+    ('ghi', 'foo', 'bar', 10),
+    ('ghi', 'foo', 'bar', 2),
+    ('ghi', 'foo', 'bar', 12),
+    ('ghi', 'foo', 'bar', 11),
+    ('ghi', 'foo', 'bar', 12),
+    ('ghi', 'foo', 'bar', 12),
+    ('ghi', 'foo', 'bar', 25), -- Potential outlier in 'ghi' group
+    ('ghi', 'foo', 'bar', 12),
+    ('ghi', 'foo', 'bar', 14),
+    ('ghi', 'foo', 'bar', 11),
+    ('jkl', 'heh', 'aha', 20),
+    ('jkl', 'heh', 'aha', 21),
+    ('jkl', 'heh', 'aha', 20),
+    ('jkl', 'heh', 'aha', 22),
+    ('jkl', 'heh', 'aha', 23),
+    ('jkl', 'heh', 'aha', 22),
+    ('jkl', 'heh', 'aha', 21),
+    ('jkl', 'heh', 'aha', 48), -- Potential outliers in 'jkl' group
+    ('jkl', 'heh', 'aha', 49),
+    ('jkl', 'heh', 'aha', 48),
+    ('jkl', 'heh', 'aha', 45),
+    ('jkl', 'heh', 'aha', 46),
+    ('jkl', 'heh', 'aha', 47),
+    ('jkl', 'heh', 'aha', 48),
+
+    -- Additional Synthetic Data for variety and larger groups
+
+    -- Group 'mno', 'xyz', 'pqr' - tight cluster with one clear outlier
+    ('mno', 'xyz', 'pqr', 50),
+    ('mno', 'xyz', 'pqr', 51),
+    ('mno', 'xyz', 'pqr', 50),
+    ('mno', 'xyz', 'pqr', 52),
+    ('mno', 'xyz', 'pqr', 51),
+    ('mno', 'xyz', 'pqr', 150), -- Clear outlier
+
+    -- Group 'stu', 'uvw', 'rst' - broader range, multiple smaller outliers
+    ('stu', 'uvw', 'rst', 100),
+    ('stu', 'uvw', 'rst', 105),
+    ('stu', 'uvw', 'rst', 102),
+    ('stu', 'uvw', 'rst', 108),
+    ('stu', 'uvw', 'rst', 103),
+    ('stu', 'uvw', 'rst', 15),  -- Low outlier
+    ('stu', 'uvw', 'rst', 106),
+    ('stu', 'uvw', 'rst', 200), -- High outlier
+    ('stu', 'uvw', 'rst', 104),
+    ('stu', 'uvw', 'rst', 107),
+    ('stu', 'uvw', 'rst', 101),
+
+    -- Group 'apple', 'orange', 'grape' - very small group, 3 members
+    ('apple', 'orange', 'grape', 5),
+    ('apple', 'orange', 'grape', 6),
+    ('apple', 'orange', 'grape', 50), -- Outlier in small group
+
+    -- Group 'cat', 'dog', 'mouse' - many similar values, one very high outlier
+    ('cat', 'dog', 'mouse', 70),
+    ('cat', 'dog', 'mouse', 71),
+    ('cat', 'dog', 'mouse', 70),
+    ('cat', 'dog', 'mouse', 72),
+    ('cat', 'dog', 'mouse', 71),
+    ('cat', 'dog', 'mouse', 70),
+    ('cat', 'dog', 'mouse', 73),
+    ('cat', 'dog', 'mouse', 72),
+    ('cat', 'dog', 'mouse', 71),
+    ('cat', 'dog', 'mouse', 70),
+    ('cat', 'dog', 'mouse', 72),
+    ('cat', 'dog', 'mouse', 71),
+    ('cat', 'dog', 'mouse', 70),
+    ('cat', 'dog', 'mouse', 72),
+    ('cat', 'dog', 'mouse', 71),
+    ('cat', 'dog', 'mouse', 500), -- Major outlier
+
+    -- Group 'city', 'country', 'continent' - wide range of values, no clear statistical outliers based on visual inspection
+    ('city', 'country', 'continent', 1000),
+    ('city', 'country', 'continent', 1050),
+    ('city', 'country', 'continent', 1200),
+    ('city', 'country', 'continent', 980),
+    ('city', 'country', 'continent', 1100),
+    ('city', 'country', 'continent', 1020),
+    ('city', 'country', 'continent', 950),
+    ('city', 'country', 'continent', 1080)
+
+AS temp_table (attr1, attr2, attr3, tgt);
+
+
+
+
+CALL detect_outliers_pyod(
+    input_table_name => 'YOUR_LARGER_TABLE',
+    group_columns => ARRAY_CONSTRUCT('ATTR1', 'ATTR2', 'ATTR3'),
+    target_column => 'TGT',
+    contamination_rate => 0.05, -- Adjust this value based on your domain knowledge
+    output_table_name => 'YOUR_LARGER_TABLE_WITH_OUTLIERS'
+);
+
+
+
+SELECT * FROM YOUR_LARGER_TABLE_WITH_OUTLIERS
+ORDER BY ATTR1, ATTR2, ATTR3;
