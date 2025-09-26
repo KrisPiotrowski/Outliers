@@ -235,4 +235,105 @@ FROM tmp_out S,
 
 select count(*) from tmp_out;
            
+		   
+		   
+		   
+		   -----------------
+		   
+CREATE OR REPLACE FUNCTION DETECT_OUTLIERS_HBOS (
+    "REGION" VARCHAR,
+    "PRODUCT_CATEGORY" VARCHAR,
+    "SALE_AMOUNT" INT
+)
+RETURNS TABLE (
+    "REGION" VARCHAR,
+    "PRODUCT_CATEGORY" VARCHAR,
+    "SALE_AMOUNT" INT,
+    "OUTLIER_SCORE" FLOAT,
+    "IS_OUTLIER" BOOLEAN
+)
+LANGUAGE PYTHON
+RUNTIME_VERSION = '3.8'
+PACKAGES = ('pandas', 'pyod', 'scikit-learn')
+HANDLER = 'OutlierDetectorHBOS'
+AS
+$$
+import pandas as pd
+# Import the HBOS model from the PyOD library
+from pyod.models.hbos import HBOS
+from typing import Iterable, Tuple
+
+# This class structure correctly handles partition-wise processing in Snowflake
+class OutlierDetectorHBOS:
+    
+    # Called ONCE per partition. Initializes a list to hold the rows.
+    def __init__(self):
+        self._rows = []
+
+    # Called FOR EACH ROW in the partition. It stores the row and returns an empty iterable.
+    def process(self, region: str, category: str, amount: int) -> Iterable[Tuple]:
+        self._rows.append((region, category, amount))
+        return []
+
+    # Called ONCE after all rows for the partition have been processed.
+    # This is where the HBOS algorithm is executed.
+    def end_partition(self) -> Iterable[Tuple]:
+        
+        # 1. Convert the collected rows into a Pandas DataFrame.
+        df = pd.DataFrame(self._rows, columns=['REGION', 'PRODUCT_CATEGORY', 'SALE_AMOUNT'])
+        
+        # 2. Isolate the data to be assessed and handle any potential null values.
+        data_to_assess = df[['SALE_AMOUNT']].dropna()
+        
+        # 3. Handle edge cases: If a group is empty or too small, flag nothing as an outlier.
+        if data_to_assess.empty or len(data_to_assess) < 4:
+            df['OUTLIER_SCORE'] = None
+            df['IS_OUTLIER'] = False
+        else:
+            # 4. --- CORE LOGIC: Apply the HBOS model ---
+            # HBOS is extremely fast and works by building histograms.
+            # The contamination rate is the assumed percentage of outliers (e.g., 10%). This can be tuned.
+            model = HBOS(contamination=0.1)
+            model.fit(data_to_assess.values)
+
+            # 5. Create a new DataFrame with the results.
+            results = pd.DataFrame({
+                'OUTLIER_SCORE': model.decision_scores_,
+                'IS_OUTLIER': model.labels_.astype(bool)
+            }, index=data_to_assess.index)
+
+            # 6. Merge the results back to the original DataFrame.
+            df = df.merge(results, left_index=True, right_index=True, how='left')
+            df['IS_OUTLIER'].fillna(False, inplace=True)
+
+        # 7. Yield the final results row by row as tuples.
+        # The tuple order must exactly match the `RETURNS TABLE` clause.
+        for _, row in df.iterrows():
+            yield (
+                row['REGION'], 
+                row['PRODUCT_CATEGORY'], 
+                row['SALE_AMOUNT'], 
+                row['OUTLIER_SCORE'], 
+                row['IS_OUTLIER']
+            )
+$$;
+
+
+
+
+-- Create a table with the results from the new HBOS UDTF
+CREATE OR REPLACE TABLE SALES_DATA_OUTLIERS_HBOS_RESULT AS
+SELECT 
+    REGION,
+    PRODUCT_CATEGORY,
+    SALE_AMOUNT,
+    OUTLIER_SCORE,
+    IS_OUTLIER
+FROM 
+    SALES_DATA, -- Your source table
+    TABLE(DETECT_OUTLIERS_HBOS(REGION, PRODUCT_CATEGORY, SALE_AMOUNT) 
+          OVER (PARTITION BY REGION, PRODUCT_CATEGORY));
+
+-- Verify the results
+SELECT * FROM SALES_DATA_OUTLIERS_HBOS_RESULT ORDER BY REGION, PRODUCT_CATEGORY, IS_OUTLIER, SALE_AMOUNT;
 
