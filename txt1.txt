@@ -240,7 +240,7 @@ select count(*) from tmp_out;
 		   
 		   -----------------
 		   
-CREATE OR REPLACE FUNCTION DETECT_OUTLIERS_HBOS (
+		   CREATE OR REPLACE FUNCTION DETECT_OUTLIERS_VECTORIZED_HBOS (
     "REGION" VARCHAR,
     "PRODUCT_CATEGORY" VARCHAR,
     "SALE_AMOUNT" INT
@@ -255,69 +255,53 @@ RETURNS TABLE (
 LANGUAGE PYTHON
 RUNTIME_VERSION = '3.8'
 PACKAGES = ('pandas', 'pyod', 'scikit-learn')
-HANDLER = 'OutlierDetectorHBOS'
+HANDLER = 'VectorizedOutlierDetector'
 AS
 $$
 import pandas as pd
-# Import the HBOS model from the PyOD library
 from pyod.models.hbos import HBOS
-from typing import Iterable, Tuple
 
-# This class structure correctly handles partition-wise processing in Snowflake
-class OutlierDetectorHBOS:
+# This is a stateless handler. Snowflake calls its `process` method only ONCE per partition.
+class VectorizedOutlierDetector:
     
-    # Called ONCE per partition. Initializes a list to hold the rows.
-    def __init__(self):
-        self._rows = []
-
-    # Called FOR EACH ROW in the partition. It stores the row and returns an empty iterable.
-    def process(self, region: str, category: str, amount: int) -> Iterable[Tuple]:
-        self._rows.append((region, category, amount))
-        return []
-
-    # Called ONCE after all rows for the partition have been processed.
-    # This is where the HBOS algorithm is executed.
-    def end_partition(self) -> Iterable[Tuple]:
+    # The signature is the most critical part. It now accepts Pandas Series.
+    # Snowflake automatically batches the data for each column into a Series.
+    def process(self, region_series: pd.Series, category_series: pd.Series, amount_series: pd.Series) -> pd.DataFrame:
         
-        # 1. Convert the collected rows into a Pandas DataFrame.
-        df = pd.DataFrame(self._rows, columns=['REGION', 'PRODUCT_CATEGORY', 'SALE_AMOUNT'])
+        # 1. Reconstruct the input DataFrame from the input Series. This is very fast.
+        df = pd.DataFrame({
+            'REGION': region_series,
+            'PRODUCT_CATEGORY': category_series,
+            'SALE_AMOUNT': amount_series
+        })
+
+        # From this point on, the logic is identical to what was in `end_partition`
         
-        # 2. Isolate the data to be assessed and handle any potential null values.
+        # 2. Isolate data and handle nulls
         data_to_assess = df[['SALE_AMOUNT']].dropna()
         
-        # 3. Handle edge cases: If a group is empty or too small, flag nothing as an outlier.
+        # 3. Handle small or empty groups
         if data_to_assess.empty or len(data_to_assess) < 4:
             df['OUTLIER_SCORE'] = None
             df['IS_OUTLIER'] = False
         else:
-            # 4. --- CORE LOGIC: Apply the HBOS model ---
-            # HBOS is extremely fast and works by building histograms.
-            # The contamination rate is the assumed percentage of outliers (e.g., 10%). This can be tuned.
+            # 4. Apply the fast HBOS model
             model = HBOS(contamination=0.1)
             model.fit(data_to_assess.values)
 
-            # 5. Create a new DataFrame with the results.
+            # 5. Create results and merge them back
             results = pd.DataFrame({
                 'OUTLIER_SCORE': model.decision_scores_,
                 'IS_OUTLIER': model.labels_.astype(bool)
             }, index=data_to_assess.index)
 
-            # 6. Merge the results back to the original DataFrame.
             df = df.merge(results, left_index=True, right_index=True, how='left')
             df['IS_OUTLIER'].fillna(False, inplace=True)
 
-        # 7. Yield the final results row by row as tuples.
-        # The tuple order must exactly match the `RETURNS TABLE` clause.
-        for _, row in df.iterrows():
-            yield (
-                row['REGION'], 
-                row['PRODUCT_CATEGORY'], 
-                row['SALE_AMOUNT'], 
-                row['OUTLIER_SCORE'], 
-                row['IS_OUTLIER']
-            )
+        # 6. Return the entire resulting DataFrame.
+        # The columns must match the `RETURNS TABLE` clause.
+        return df
 $$;
-
 
 
 
