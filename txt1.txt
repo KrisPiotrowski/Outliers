@@ -326,6 +326,8 @@ SELECT * FROM SALES_DATA_OUTLIERS_HBOS_RESULT ORDER BY REGION, PRODUCT_CATEGORY,
 --------------
 
 
+
+
 -- This version correctly uses the @vectorized decorator on the end_partition method,
 -- aligning with the specific UDTF pattern you found in the documentation.
 CREATE OR REPLACE FUNCTION DETECT_OUTLIERS_DECORATOR_HBOS (
@@ -341,7 +343,7 @@ RETURNS TABLE (
     "IS_OUTLIER" BOOLEAN
 )
 LANGUAGE PYTHON
-RUNTIME_VERSION = '3.8'
+RUNTIME_VERSION = '3.12'
 PACKAGES = ('pandas', 'pyod', 'scikit-learn')
 HANDLER = 'VectorizedEndPartitionHBOS'
 AS
@@ -356,14 +358,14 @@ class VectorizedEndPartitionHBOS:
     
     # An __init__ method is optional but good practice for this pattern.
     # It's called once per partition. You could initialize models or variables here.
-    def __init__(self):
-        pass
+    # def __init__(self):
+    #     pass
 
     # Per the documentation, there is NO process() method in this pattern.
 
     # The @vectorized decorator tells Snowflake to pass the entire partition's data
     # as a single DataFrame to this method at the end of the partition.
-    @vectorized
+    @vectorized(input=pd.DataFrame)
     def end_partition(self, df: pd.DataFrame) -> pd.DataFrame:
         
         # 1. The input 'df' is already a complete, vectorized DataFrame for the partition.
@@ -396,12 +398,12 @@ $$;
 
 CREATE OR REPLACE TABLE SALES_DATA_OUTLIERS_DECORATOR_RESULT AS
 SELECT 
-    REGION,
-    PRODUCT_CATEGORY,
-    SALE_AMOUNT,
-    OUTLIER_SCORE,
-    IS_OUTLIER
+    t.REGION,
+    t.PRODUCT_CATEGORY,
+    t.SALE_AMOUNT,
+    t.OUTLIER_SCORE,
+    t.IS_OUTLIER
 FROM 
-    SALES_DATA,
+    SALES_DATA s,
     TABLE(DETECT_OUTLIERS_DECORATOR_HBOS(REGION, PRODUCT_CATEGORY, SALE_AMOUNT) 
-          OVER (PARTITION BY REGION, PRODUCT_CATEGORY));
+          OVER (PARTITION BY REGION, PRODUCT_CATEGORY)) t;
