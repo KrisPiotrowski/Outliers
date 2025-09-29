@@ -321,3 +321,87 @@ FROM
 -- Verify the results
 SELECT * FROM SALES_DATA_OUTLIERS_HBOS_RESULT ORDER BY REGION, PRODUCT_CATEGORY, IS_OUTLIER, SALE_AMOUNT;
 
+
+
+--------------
+
+
+-- This version correctly uses the @vectorized decorator on the end_partition method,
+-- aligning with the specific UDTF pattern you found in the documentation.
+CREATE OR REPLACE FUNCTION DETECT_OUTLIERS_DECORATOR_HBOS (
+    "REGION" VARCHAR,
+    "PRODUCT_CATEGORY" VARCHAR,
+    "SALE_AMOUNT" INT
+)
+RETURNS TABLE (
+    "REGION" VARCHAR,
+    "PRODUCT_CATEGORY" VARCHAR,
+    "SALE_AMOUNT" INT,
+    "OUTLIER_SCORE" FLOAT,
+    "IS_OUTLIER" BOOLEAN
+)
+LANGUAGE PYTHON
+RUNTIME_VERSION = '3.8'
+PACKAGES = ('pandas', 'pyod', 'scikit-learn')
+HANDLER = 'VectorizedEndPartitionHBOS'
+AS
+$$
+import pandas as pd
+from pyod.models.hbos import HBOS
+# --- CRITICAL: Import the vectorized decorator ---
+from _snowflake import vectorized
+
+# This class follows the pattern you found: a stateful container with a vectorized end_partition.
+class VectorizedEndPartitionHBOS:
+    
+    # An __init__ method is optional but good practice for this pattern.
+    # It's called once per partition. You could initialize models or variables here.
+    def __init__(self):
+        pass
+
+    # Per the documentation, there is NO process() method in this pattern.
+
+    # The @vectorized decorator tells Snowflake to pass the entire partition's data
+    # as a single DataFrame to this method at the end of the partition.
+    @vectorized
+    def end_partition(self, df: pd.DataFrame) -> pd.DataFrame:
+        
+        # 1. The input 'df' is already a complete, vectorized DataFrame for the partition.
+        
+        # 2. Isolate the data to be assessed and handle any potential null values.
+        data_to_assess = df[['SALE_AMOUNT']].dropna()
+        
+        # 3. Handle edge cases.
+        if data_to_assess.empty or len(data_to_assess) < 4:
+            df['OUTLIER_SCORE'] = None
+            df['IS_OUTLIER'] = False
+        else:
+            # 4. Apply the fast HBOS model.
+            model = HBOS(contamination=0.1)
+            model.fit(data_to_assess.values)
+
+            # 5. Create results and merge them back.
+            results = pd.DataFrame({
+                'OUTLIER_SCORE': model.decision_scores_,
+                'IS_OUTLIER': model.labels_.astype(bool)
+            }, index=data_to_assess.index)
+
+            df = df.merge(results, left_index=True, right_index=True, how='left')
+            df['IS_OUTLIER'].fillna(False, inplace=True)
+
+        # 6. Return the entire resulting DataFrame.
+        return df
+$$;
+
+
+CREATE OR REPLACE TABLE SALES_DATA_OUTLIERS_DECORATOR_RESULT AS
+SELECT 
+    REGION,
+    PRODUCT_CATEGORY,
+    SALE_AMOUNT,
+    OUTLIER_SCORE,
+    IS_OUTLIER
+FROM 
+    SALES_DATA,
+    TABLE(DETECT_OUTLIERS_DECORATOR_HBOS(REGION, PRODUCT_CATEGORY, SALE_AMOUNT) 
+          OVER (PARTITION BY REGION, PRODUCT_CATEGORY));
