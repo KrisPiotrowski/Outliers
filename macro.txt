@@ -1,0 +1,48 @@
+{% macro split_long_words(input_string, max_word_length) %}
+  (
+    with recursive words as (
+      -- Split the input string into individual words
+      select
+        seq4() as word_id,
+        trim(value) as word
+      from
+        table(split_to_table({{ input_string }}, ' '))
+    ),
+    split_words as (
+      -- Recursive CTE to split long words
+      select
+        word_id,
+        word,
+        1 as part_index,
+        case
+          when len(word) > {{ max_word_length }} then left(word, {{ max_word_length }})
+          else word
+        end as split_part,
+        case
+          when len(word) > {{ max_word_length }} then right(word, len(word) - {{ max_word_length }})
+          else ''
+        end as remaining_part
+      from words
+
+      union all
+
+      select
+        word_id,
+        word,
+        part_index + 1,
+        case
+          when len(remaining_part) > {{ max_word_length }} then left(remaining_part, {{ max_word_length }})
+          else remaining_part
+        end as split_part,
+        case
+          when len(remaining_part) > {{ max_word_length }} then right(remaining_part, len(remaining_part) - {{ max_word_length }})
+          else ''
+        end as remaining_part
+      from split_words
+      where len(remaining_part) > 0
+    )
+    -- Aggregate the split words back into a single string
+    select listagg(split_part, ' ') within group (order by word_id, part_index)
+    from split_words
+  )
+{% endmacro %}
